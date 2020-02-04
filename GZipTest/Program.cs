@@ -52,6 +52,11 @@ namespace GzipTest
                         Console.WriteLine("Start compression...");
                         compressor.StartCompression();
 
+                        if(compressor.FatalException != null)
+                        {
+                            throw compressor.FatalException;
+                        }
+
                         Console.WriteLine("Compression is complete!");
                     }
                     else if (action == "decompress")
@@ -69,6 +74,11 @@ namespace GzipTest
                         Console.WriteLine("Start decompression...");
                         compressor.StartDecompression();
 
+                        if (compressor.FatalException != null)
+                        {
+                            throw compressor.FatalException;
+                        }
+
                         Console.WriteLine("Decompression is complete!");
                     }
                 }
@@ -76,6 +86,7 @@ namespace GzipTest
             catch(Exception ex)
             {
                 HandleException(ex);
+                Console.ReadKey();
 
                 return 1;
             }

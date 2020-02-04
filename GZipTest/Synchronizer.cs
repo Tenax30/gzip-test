@@ -4,6 +4,8 @@
     {
         public object ReadLocker { get; private set; }
         public object WriteLocker { get; private set; }
+        public object ExceptionLocker { get; set; }
+
         public int NextId { get; private set; }
         private int _freeId;
 
@@ -11,6 +13,7 @@
         {
             ReadLocker = new object();
             WriteLocker = new object();
+            ExceptionLocker = new object();
             NextId = _freeId = 0;
         }
 

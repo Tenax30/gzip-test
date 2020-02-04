@@ -14,11 +14,15 @@ namespace GzipTest
         private readonly FileStream _resultStream;
         private readonly ProgressBar _progressBar;
 
+        public Exception FatalException { get; private set; }
+
         public Compressor(FileStream sourceStream, FileStream resultStream, ProgressBar progressBar)
         {
             _sourceStream = sourceStream;
             _resultStream = resultStream;
             _progressBar = progressBar;
+
+            FatalException = null;
         }
 
         #region Compression
@@ -33,22 +37,61 @@ namespace GzipTest
 
             for (int i = 0; i < Environment.ProcessorCount; i++)
             {
-                var compressionThread = new Thread(() => Compress(synchronizer));
+                var compressionThread = new Thread(() => TryCompress(synchronizer, compressionThreads));
 
                 compressionThreads.Add(compressionThread);
-                compressionThread.Start();
             }
 
+            compressionThreads.ForEach(t => t.Start());
             compressionThreads.ForEach(t => t.Join());
+        }
+
+        private void TryCompress(Synchronizer synchronizer, List<Thread> compressionThreads)
+        {
+            try
+            {
+                try
+                {
+                    Compress(synchronizer);
+                }
+                catch (Exception ex)
+                {
+                    if(ex is ThreadAbortException)
+                    {
+                        throw;
+                    }
+
+                    lock(synchronizer.ExceptionLocker)
+                    {
+                        if(Thread.CurrentThread.ThreadState == ThreadState.AbortRequested)
+                        {
+                            return;
+                        }
+
+                        FatalException = ex;
+
+                        foreach(var thread in compressionThreads)
+                        {
+                           if(thread != Thread.CurrentThread)
+                           {
+                                thread.Abort();
+                           }
+                        }
+                    }
+                }
+            }
+            catch(ThreadAbortException)
+            {
+            }
         }
 
         private void Compress(Synchronizer synchronizer)
         {
             while (true)
             {
-                int currentId;
+                int currentId = 0;
 
-                byte[] readBytes;
+                byte[] readBytes = new byte[2];
 
                 lock (synchronizer.ReadLocker)
                 {
@@ -60,6 +103,7 @@ namespace GzipTest
                     }
 
                     readBytes = new byte[Math.Min(ureadedBytesLength, BlockSize)];
+
                     _sourceStream.Read(readBytes, 0, readBytes.Length);
 
                     currentId = synchronizer.GetFreeId();
@@ -119,13 +163,52 @@ namespace GzipTest
 
             for (int i = 0; i < Environment.ProcessorCount; i++)
             {
-                var decompressionThread = new Thread(() => Decompress(synchronizer));
+                var decompressionThread = new Thread(() => TryDecompress(synchronizer, decompressionThreads));
 
                 decompressionThreads.Add(decompressionThread);
-                decompressionThread.Start();
             }
 
+            decompressionThreads.ForEach(t => t.Start());
             decompressionThreads.ForEach(t => t.Join());
+        }
+
+        private void TryDecompress(Synchronizer synchronizer, List<Thread> decompressionThreads)
+        {
+            try
+            {
+                try
+                {
+                    Decompress(synchronizer);
+                }
+                catch (Exception ex)
+                {
+                    if (ex is ThreadAbortException)
+                    {
+                        throw;
+                    }
+
+                    lock (synchronizer.ExceptionLocker)
+                    {
+                        if (Thread.CurrentThread.ThreadState == ThreadState.AbortRequested)
+                        {
+                            return;
+                        }
+
+                        FatalException = ex;
+
+                        foreach (var thread in decompressionThreads)
+                        {
+                            if (thread != Thread.CurrentThread)
+                            {
+                                thread.Abort();
+                            }
+                        }
+                    }
+                }
+            }
+            catch (ThreadAbortException)
+            {
+            }
         }
 
         private void Decompress(Synchronizer synchronizer)
