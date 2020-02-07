@@ -72,7 +72,7 @@ namespace GzipTest
                         }
 
                         Console.WriteLine("Start decompression...");
-                        compressor.StartDecompression();
+                        //compressor.StartDecompression();
 
                         if (compressor.FatalException != null)
                         {

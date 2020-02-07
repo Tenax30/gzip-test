@@ -43,16 +43,20 @@
     <Reference Include="System.Xml" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="Block.cs" />
     <Compile Include="Compressor.cs" />
     <Compile Include="Exceptions\EmptyFileException.cs" />
     <Compile Include="Exceptions\FileCorruptException.cs" />
     <Compile Include="Exceptions\FileFormatException.cs" />
     <Compile Include="Exceptions\NoFreeDriveSpaceException.cs" />
     <Compile Include="Exceptions\FilesMatchException.cs" />
+    <Compile Include="NumberedQueue.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="ProgressBar.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="Reader.cs" />
     <Compile Include="Synchronizer.cs" />
+    <Compile Include="Writer.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="App.config" />

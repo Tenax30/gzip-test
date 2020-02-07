@@ -10,16 +10,26 @@ namespace GzipTest
 {
     class Compressor
     {
-        private readonly FileStream _sourceStream;
-        private readonly FileStream _resultStream;
+        private const int BlockSize = 1048576;
+
         private readonly ProgressBar _progressBar;
+
+        private readonly Reader _reader;
+        private readonly Writer _writer;
+
+        private readonly NumberedQueue _readerQueue;
+        private readonly NumberedQueue _writerQueue;
 
         public Exception FatalException { get; private set; }
 
         public Compressor(FileStream sourceStream, FileStream resultStream, ProgressBar progressBar)
         {
-            _sourceStream = sourceStream;
-            _resultStream = resultStream;
+            _readerQueue = new NumberedQueue();
+            _writerQueue = new NumberedQueue();
+
+            _reader = new Reader(sourceStream, _readerQueue, BlockSize);
+            _writer = new Writer(resultStream, _writerQueue);
+
             _progressBar = progressBar;
 
             FatalException = null;
@@ -27,17 +37,16 @@ namespace GzipTest
 
         #region Compression
 
-        private const int BlockSize = 1048576;
-
         public void StartCompression()
         {
-            var synchronizer = new Synchronizer();
+            _reader.StartRead();
+            _writer.StartWrite();
 
             var compressionThreads = new List<Thread>();
 
-            for (int i = 0; i < Environment.ProcessorCount; i++)
+            for (int i = 0; i < Environment.ProcessorCount / 4; i++)
             {
-                var compressionThread = new Thread(() => TryCompress(synchronizer, compressionThreads));
+                var compressionThread = new Thread(() => Compress());
 
                 compressionThreads.Add(compressionThread);
             }
@@ -52,7 +61,7 @@ namespace GzipTest
             {
                 try
                 {
-                    Compress(synchronizer);
+                    //Compress(synchronizer);
                 }
                 catch (Exception ex)
                 {
@@ -85,29 +94,11 @@ namespace GzipTest
             }
         }
 
-        private void Compress(Synchronizer synchronizer)
+        private void Compress()
         {
-            while (true)
+            while (!_reader.IsFinished && _readerQueue.GetCount() > 0)
             {
-                int currentId = 0;
-
-                byte[] readBytes = new byte[2];
-
-                lock (synchronizer.ReadLocker)
-                {
-                    long ureadedBytesLength = _sourceStream.Length - _sourceStream.Position;
-
-                    if (ureadedBytesLength == 0)
-                    {
-                        break;
-                    }
-
-                    readBytes = new byte[Math.Min(ureadedBytesLength, BlockSize)];
-
-                    _sourceStream.Read(readBytes, 0, readBytes.Length);
-
-                    currentId = synchronizer.GetFreeId();
-                }
+                var block = _readerQueue.Dequeue();
 
                 byte[] compressedBytes;
 
@@ -115,7 +106,7 @@ namespace GzipTest
                 {
                     using (var gzipStream = new GZipStream(memoryStream, CompressionMode.Compress))
                     {
-                        gzipStream.Write(readBytes, 0, readBytes.Length);
+                        gzipStream.Write(block.Buffer, 0, block.Buffer.Length);
                     }
 
                     compressedBytes = memoryStream.ToArray();
@@ -123,178 +114,161 @@ namespace GzipTest
 
                 BitConverter.GetBytes(compressedBytes.Length).CopyTo(compressedBytes, 4);
 
-                while (true)
-                {
-                    lock (synchronizer.WriteLocker)
-                    {
-                        if (currentId == synchronizer.NextId)
-                        {
-                            _resultStream.Write(compressedBytes, 0, compressedBytes.Length);
+                block.Buffer = compressedBytes;
 
-                            synchronizer.IncreaseNextId();
+                _writerQueue.Enqueue(block);
 
-                            Monitor.PulseAll(synchronizer.WriteLocker);
-
-                            break;
-                        }
-                        else
-                        {
-                            Monitor.Wait(synchronizer.WriteLocker);
-                        }
-                    }
-                }
-
-                _progressBar.ShowProgress(_sourceStream.Position, _sourceStream.Length);
+                //_progressBar.ShowProgress(_sourceStream.Position, _sourceStream.Length);
             }
         }
 
         #endregion
 
-        #region Decompression
+        //#region Decompression
 
-        private const int CompressedBlockInfoLength = 8;
-        private const int CheckBytesLength = 4;
+        //private const int CompressedBlockInfoLength = 8;
+        //private const int CheckBytesLength = 4;
 
-        public void StartDecompression()
-        {
-            var synchronizer = new Synchronizer();
+        //public void StartDecompression()
+        //{
+        //    var synchronizer = new Synchronizer();
 
-            var decompressionThreads = new List<Thread>();
+        //    var decompressionThreads = new List<Thread>();
 
-            for (int i = 0; i < Environment.ProcessorCount; i++)
-            {
-                var decompressionThread = new Thread(() => TryDecompress(synchronizer, decompressionThreads));
+        //    for (int i = 0; i < Environment.ProcessorCount; i++)
+        //    {
+        //        var decompressionThread = new Thread(() => TryDecompress(synchronizer, decompressionThreads));
 
-                decompressionThreads.Add(decompressionThread);
-            }
+        //        decompressionThreads.Add(decompressionThread);
+        //    }
 
-            decompressionThreads.ForEach(t => t.Start());
-            decompressionThreads.ForEach(t => t.Join());
-        }
+        //    decompressionThreads.ForEach(t => t.Start());
+        //    decompressionThreads.ForEach(t => t.Join());
+        //}
 
-        private void TryDecompress(Synchronizer synchronizer, List<Thread> decompressionThreads)
-        {
-            try
-            {
-                try
-                {
-                    Decompress(synchronizer);
-                }
-                catch (Exception ex)
-                {
-                    if (ex is ThreadAbortException)
-                    {
-                        throw;
-                    }
+        //private void TryDecompress(Synchronizer synchronizer, List<Thread> decompressionThreads)
+        //{
+        //    try
+        //    {
+        //        try
+        //        {
+        //            Decompress(synchronizer);
+        //        }
+        //        catch (Exception ex)
+        //        {
+        //            if (ex is ThreadAbortException)
+        //            {
+        //                throw;
+        //            }
 
-                    lock (synchronizer.ExceptionLocker)
-                    {
-                        if (Thread.CurrentThread.ThreadState == ThreadState.AbortRequested)
-                        {
-                            return;
-                        }
+        //            lock (synchronizer.ExceptionLocker)
+        //            {
+        //                if (Thread.CurrentThread.ThreadState == ThreadState.AbortRequested)
+        //                {
+        //                    return;
+        //                }
 
-                        FatalException = ex;
+        //                FatalException = ex;
 
-                        foreach (var thread in decompressionThreads)
-                        {
-                            if (thread != Thread.CurrentThread)
-                            {
-                                thread.Abort();
-                            }
-                        }
-                    }
-                }
-            }
-            catch (ThreadAbortException)
-            {
-            }
-        }
+        //                foreach (var thread in decompressionThreads)
+        //                {
+        //                    if (thread != Thread.CurrentThread)
+        //                    {
+        //                        thread.Abort();
+        //                    }
+        //                }
+        //            }
+        //        }
+        //    }
+        //    catch (ThreadAbortException)
+        //    {
+        //    }
+        //}
 
-        private void Decompress(Synchronizer synchronizer)
-        {
-            while (true)
-            {
-                int currentId;
+        //private void Decompress(Synchronizer synchronizer)
+        //{
+        //    while (true)
+        //    {
+        //        int currentId;
 
-                byte[] compressedBytes;
-                byte[] blockInfoBytes = new byte[CompressedBlockInfoLength];
+        //        byte[] compressedBytes;
+        //        byte[] blockInfoBytes = new byte[CompressedBlockInfoLength];
 
-                lock (synchronizer.ReadLocker)
-                {
-                    long ureadedBytesLength = _sourceStream.Length - _sourceStream.Position;
+        //        lock (synchronizer.ReadLocker)
+        //        {
+        //            long ureadedBytesLength = _sourceStream.Length - _sourceStream.Position;
 
-                    if (ureadedBytesLength == 0)
-                    {
-                        break;
-                    }
+        //            if (ureadedBytesLength == 0)
+        //            {
+        //                break;
+        //            }
 
-                    _sourceStream.Read(blockInfoBytes, 0, blockInfoBytes.Length);
+        //            _sourceStream.Read(blockInfoBytes, 0, blockInfoBytes.Length);
 
-                    bool isValidBlock = CheckCompressedBlock(blockInfoBytes.Take(CheckBytesLength).ToArray());
+        //            bool isValidBlock = CheckCompressedBlock(blockInfoBytes.Take(CheckBytesLength).ToArray());
 
-                    if (!isValidBlock)
-                    {
-                        throw new FileCorruptException();
-                    }
+        //            if (!isValidBlock)
+        //            {
+        //                throw new FileCorruptException();
+        //            }
 
-                    int compressedBytesLength = BitConverter.ToInt32(blockInfoBytes, 4);
-                    compressedBytes = new byte[compressedBytesLength];
-                    blockInfoBytes.CopyTo(compressedBytes, 0);
-                    _sourceStream.Read(compressedBytes, 8, compressedBytes.Length - 8);
+        //            int compressedBytesLength = BitConverter.ToInt32(blockInfoBytes, 4);
+        //            compressedBytes = new byte[compressedBytesLength];
+        //            blockInfoBytes.CopyTo(compressedBytes, 0);
+        //            _sourceStream.Read(compressedBytes, 8, compressedBytes.Length - 8);
 
-                    currentId = synchronizer.GetFreeId();
-                }
+        //            currentId = synchronizer.GetFreeId();
+        //        }
 
-                byte[] decompressedBytes;
+        //        byte[] decompressedBytes;
 
-                using (var compressedMemoryStream = new MemoryStream(compressedBytes))
-                using (var gzipStream = new GZipStream(compressedMemoryStream, CompressionMode.Decompress))
-                using (var decompressedMemoryStream = new MemoryStream())
-                {
-                    gzipStream.CopyTo(decompressedMemoryStream);
-                    decompressedBytes = decompressedMemoryStream.ToArray();
-                }
+        //        using (var compressedMemoryStream = new MemoryStream(compressedBytes))
+        //        using (var gzipStream = new GZipStream(compressedMemoryStream, CompressionMode.Decompress))
+        //        using (var decompressedMemoryStream = new MemoryStream())
+        //        {
+        //            gzipStream.CopyTo(decompressedMemoryStream);
+        //            decompressedBytes = decompressedMemoryStream.ToArray();
+        //        }
 
-                while (true)
-                {
-                    lock (synchronizer.WriteLocker)
-                    {
-                        if (currentId == synchronizer.NextId)
-                        {
-                            _resultStream.Write(decompressedBytes, 0, decompressedBytes.Length);
+        //        while (true)
+        //        {
+        //            lock (synchronizer.WriteLocker)
+        //            {
+        //                if (currentId == synchronizer.NextId)
+        //                {
+        //                    _resultStream.Write(decompressedBytes, 0, decompressedBytes.Length);
 
-                            synchronizer.IncreaseNextId();
+        //                    synchronizer.IncreaseNextId();
 
-                            Monitor.PulseAll(synchronizer.WriteLocker);
+        //                    Monitor.PulseAll(synchronizer.WriteLocker);
 
-                            break;
-                        }
-                        else
-                        {
-                            Monitor.Wait(synchronizer.WriteLocker);
-                        }
-                    }
-                }
+        //                    break;
+        //                }
+        //                else
+        //                {
+        //                    Monitor.Wait(synchronizer.WriteLocker);
+        //                }
+        //            }
+        //        }
 
-                _progressBar.ShowProgress(_sourceStream.Position, _sourceStream.Length);
-            }
-        }
+        //        _progressBar.ShowProgress(_sourceStream.Position, _sourceStream.Length);
+        //    }
+        //}
 
-        private bool CheckCompressedBlock(byte[] checkInfoBytes)
-        {
-            const int validCompressedBlockInfo = 559903;
+        //private bool CheckCompressedBlock(byte[] checkInfoBytes)
+        //{
+        //    const int validCompressedBlockInfo = 559903;
 
-            int currentCompressedBlockInfo = BitConverter.ToInt32(checkInfoBytes, 0);
+        //    int currentCompressedBlockInfo = BitConverter.ToInt32(checkInfoBytes, 0);
 
-            if(validCompressedBlockInfo != currentCompressedBlockInfo)
-            {
-                return false;
-            }
+        //    if(validCompressedBlockInfo != currentCompressedBlockInfo)
+        //    {
+        //        return false;
+        //    }
 
-            return true;
-        }
+        //    return true;
+        //}
 
-        #endregion
+        //#endregion
     }
 }
