@@ -26,38 +26,36 @@ namespace GzipTest
                 var driveInfo = new DriveInfo(resultFileDrive);
                 long freeDriveSpace = driveInfo.AvailableFreeSpace;
 
-                if (sourceFileInfo.FullName == resultFileInfo.FullName)
-                {
-                    throw new FilesMatchException();
-                }
-
                 using (var sourceStream = new FileStream(sourceFileInfo.FullName, FileMode.Open))
-                using (var resultStream = new FileStream(resultFileInfo.FullName + ".gz", FileMode.Create))
+                using (var resultStream = new FileStream(resultFileInfo.FullName, FileMode.Create))
                 {
-                    if (sourceStream.Length == 0)
-                    {
-                        throw new EmptyFileException();
-                    }
-
                     var progressBar = new ProgressBar();
                     var compressor = new Compressor(sourceStream, resultStream, progressBar);
 
                     if (action == "compress")
                     {
-                        if(freeDriveSpace < sourceStream.Length)
+                        if (freeDriveSpace < sourceStream.Length)
                         {
                             throw new NoFreeDriveSpaceException();
                         }
 
-                        Console.WriteLine("Start compression...");
-                        compressor.StartCompression();
-
-                        if(compressor.FatalException != null)
+                        if (sourceStream.Length == 0)
                         {
-                            throw compressor.FatalException;
+                            byte[] buffer = FormEmptyFile();
+                            resultStream.Write(buffer, 0, buffer.Length);
                         }
+                        else
+                        {
+                            Console.WriteLine("Start compression...");
+                            compressor.StartCompression();
 
-                        Console.WriteLine("Compression is complete!");
+                            if (compressor.FatalException != null)
+                            {
+                                throw compressor.FatalException;
+                            }
+
+                            Console.WriteLine("Compression is complete!");
+                        }
                     }
                     else if (action == "decompress")
                     {
@@ -83,15 +81,36 @@ namespace GzipTest
                     }
                 }
             }
-            catch(Exception ex)
+            catch (Exception ex)
             {
                 HandleException(ex);
                 Console.ReadKey();
-
                 return 1;
             }
 
             return 0;
+        }
+
+        private static byte[] FormEmptyFile()
+        {
+            byte[] buffer = new byte[13];
+            buffer[0] = 31;
+            buffer[1] = 139;
+            buffer[2] = 8;
+            buffer[3] = 0;
+            buffer[4] = 0;
+            buffer[5] = 0;
+            buffer[6] = 0;
+            buffer[7] = 0;
+            buffer[8] = 0;
+            buffer[9] = 0;
+            buffer[10] = 0;
+            buffer[11] = 0;
+            buffer[12] = 0;
+
+            BitConverter.GetBytes(buffer.Length).CopyTo(buffer, 4);
+
+            return buffer;
         }
 
         private static void HandleException(Exception thrownEx)
@@ -110,14 +129,6 @@ namespace GzipTest
 
                 case NoFreeDriveSpaceException driveSpaceEx:
                     Console.WriteLine("No free drive space for file recording");
-                    break;
-
-                case EmptyFileException emptyFileEx:
-                    Console.WriteLine("Unable to process empty file");
-                    break;
-
-                case FilesMatchException filesMatchEx:
-                    Console.WriteLine("Source and result files mustn't mutch");
                     break;
 
                 case FileFormatException formatEx:

@@ -10,104 +10,114 @@ namespace GzipTest
 {
     class Compressor
     {
+
+
         private readonly FileStream _sourceStream;
         private readonly FileStream _resultStream;
         private readonly ProgressBar _progressBar;
 
-        public Exception FatalException { get; private set; }
+        private Reader _reader;
+        private Writer _writer;
+
+        private bool _isAborted = false;
+        private object _locker = new object();
+        private CompressionMode _mode;
+
+        public Exception FatalException { get; set; } = null;
 
         public Compressor(FileStream sourceStream, FileStream resultStream, ProgressBar progressBar)
         {
             _sourceStream = sourceStream;
             _resultStream = resultStream;
             _progressBar = progressBar;
-
-            FatalException = null;
         }
-
-        #region Compression
-
-        private const int BlockSize = 1048576;
 
         public void StartCompression()
         {
-            var synchronizer = new Synchronizer();
+            _mode = CompressionMode.Compress;
+            Start();
+        }
 
-            var compressionThreads = new List<Thread>();
+        public void StartDecompression()
+        {
+            _mode = CompressionMode.Decompress;
+            Start();
+        }
+
+        private void Start()
+        {
+            _reader = new Reader(_sourceStream, _mode);
+            _writer = new Writer(_resultStream);
+
+            _reader.StartRead();
+            _writer.StartWrite();
+
+            var threads = new List<Thread>();
 
             for (int i = 0; i < Environment.ProcessorCount; i++)
             {
-                var compressionThread = new Thread(() => TryCompress(synchronizer, compressionThreads));
+                var thread = new Thread(() => TryWork(threads));
 
-                compressionThreads.Add(compressionThread);
+                threads.Add(thread);
             }
 
-            compressionThreads.ForEach(t => t.Start());
-            compressionThreads.ForEach(t => t.Join());
+            threads.ForEach(t => t.Start());
+            threads.ForEach(t => t.Join());
+
+            SetExceptions();
+            if (FatalException == null)
+                _writer.Stop();
         }
 
-        private void TryCompress(Synchronizer synchronizer, List<Thread> compressionThreads)
+        private void TryWork(List<Thread> compressionThreads)
         {
             try
             {
-                try
+                if(_mode == CompressionMode.Compress)
                 {
-                    Compress(synchronizer);
+                    Compress();
                 }
-                catch (Exception ex)
+                else if(_mode == CompressionMode.Decompress)
                 {
-                    if(ex is ThreadAbortException)
-                    {
-                        throw;
-                    }
-
-                    lock(synchronizer.ExceptionLocker)
-                    {
-                        if(Thread.CurrentThread.ThreadState == ThreadState.AbortRequested)
-                        {
-                            return;
-                        }
-
-                        FatalException = ex;
-
-                        foreach(var thread in compressionThreads)
-                        {
-                           if(thread != Thread.CurrentThread)
-                           {
-                                thread.Abort();
-                           }
-                        }
-                    }
+                    Decompress();
                 }
             }
             catch(ThreadAbortException)
             {
             }
-        }
-
-        private void Compress(Synchronizer synchronizer)
-        {
-            while (true)
+            catch(Exception ex)
             {
-                int currentId = 0;
-
-                byte[] readBytes = new byte[2];
-
-                lock (synchronizer.ReadLocker)
+                lock(_locker)
                 {
-                    long ureadedBytesLength = _sourceStream.Length - _sourceStream.Position;
-
-                    if (ureadedBytesLength == 0)
+                    if(_isAborted)
                     {
-                        break;
+                        return;
                     }
 
-                    readBytes = new byte[Math.Min(ureadedBytesLength, BlockSize)];
+                    FatalException = ex;
+                    _reader.Stop();
+                    _writer.Stop();
+                    _isAborted = true;
 
-                    _sourceStream.Read(readBytes, 0, readBytes.Length);
-
-                    currentId = synchronizer.GetFreeId();
+                    foreach (var thread in compressionThreads)
+                    {
+                        if (thread != Thread.CurrentThread)
+                        {
+                            thread.Abort();
+                        }
+                    }
                 }
+            }
+        }
+
+        private void Compress()
+        {
+            while ((!_reader.IsStopped || _reader.GetBlockCount() > 0) && !_writer.IsStopped)
+            {
+                var block = _reader.GetBlock();
+
+                if (block == null)
+                    break;
 
                 byte[] compressedBytes;
 
@@ -115,7 +125,7 @@ namespace GzipTest
                 {
                     using (var gzipStream = new GZipStream(memoryStream, CompressionMode.Compress))
                     {
-                        gzipStream.Write(readBytes, 0, readBytes.Length);
+                        gzipStream.Write(block.Buffer, 0, block.Buffer.Length);
                     }
 
                     compressedBytes = memoryStream.ToArray();
@@ -123,132 +133,26 @@ namespace GzipTest
 
                 BitConverter.GetBytes(compressedBytes.Length).CopyTo(compressedBytes, 4);
 
-                while (true)
-                {
-                    lock (synchronizer.WriteLocker)
-                    {
-                        if (currentId == synchronizer.NextId)
-                        {
-                            _resultStream.Write(compressedBytes, 0, compressedBytes.Length);
+                block.Buffer = compressedBytes;
 
-                            synchronizer.IncreaseNextId();
-
-                            Monitor.PulseAll(synchronizer.WriteLocker);
-
-                            break;
-                        }
-                        else
-                        {
-                            Monitor.Wait(synchronizer.WriteLocker);
-                        }
-                    }
-                }
+                _writer.PushBlock(block);
 
                 _progressBar.ShowProgress(_sourceStream.Position, _sourceStream.Length);
             }
         }
 
-        #endregion
-
-        #region Decompression
-
-        private const int CompressedBlockInfoLength = 8;
-        private const int CheckBytesLength = 4;
-
-        public void StartDecompression()
+        private void Decompress()
         {
-            var synchronizer = new Synchronizer();
-
-            var decompressionThreads = new List<Thread>();
-
-            for (int i = 0; i < Environment.ProcessorCount; i++)
+            while ((!_reader.IsStopped || _reader.GetBlockCount() > 0) && !_writer.IsStopped)
             {
-                var decompressionThread = new Thread(() => TryDecompress(synchronizer, decompressionThreads));
+                var block = _reader.GetBlock();
 
-                decompressionThreads.Add(decompressionThread);
-            }
-
-            decompressionThreads.ForEach(t => t.Start());
-            decompressionThreads.ForEach(t => t.Join());
-        }
-
-        private void TryDecompress(Synchronizer synchronizer, List<Thread> decompressionThreads)
-        {
-            try
-            {
-                try
-                {
-                    Decompress(synchronizer);
-                }
-                catch (Exception ex)
-                {
-                    if (ex is ThreadAbortException)
-                    {
-                        throw;
-                    }
-
-                    lock (synchronizer.ExceptionLocker)
-                    {
-                        if (Thread.CurrentThread.ThreadState == ThreadState.AbortRequested)
-                        {
-                            return;
-                        }
-
-                        FatalException = ex;
-
-                        foreach (var thread in decompressionThreads)
-                        {
-                            if (thread != Thread.CurrentThread)
-                            {
-                                thread.Abort();
-                            }
-                        }
-                    }
-                }
-            }
-            catch (ThreadAbortException)
-            {
-            }
-        }
-
-        private void Decompress(Synchronizer synchronizer)
-        {
-            while (true)
-            {
-                int currentId;
-
-                byte[] compressedBytes;
-                byte[] blockInfoBytes = new byte[CompressedBlockInfoLength];
-
-                lock (synchronizer.ReadLocker)
-                {
-                    long ureadedBytesLength = _sourceStream.Length - _sourceStream.Position;
-
-                    if (ureadedBytesLength == 0)
-                    {
-                        break;
-                    }
-
-                    _sourceStream.Read(blockInfoBytes, 0, blockInfoBytes.Length);
-
-                    bool isValidBlock = CheckCompressedBlock(blockInfoBytes.Take(CheckBytesLength).ToArray());
-
-                    if (!isValidBlock)
-                    {
-                        throw new FileCorruptException();
-                    }
-
-                    int compressedBytesLength = BitConverter.ToInt32(blockInfoBytes, 4);
-                    compressedBytes = new byte[compressedBytesLength];
-                    blockInfoBytes.CopyTo(compressedBytes, 0);
-                    _sourceStream.Read(compressedBytes, 8, compressedBytes.Length - 8);
-
-                    currentId = synchronizer.GetFreeId();
-                }
+                if (block == null)
+                    break;
 
                 byte[] decompressedBytes;
 
-                using (var compressedMemoryStream = new MemoryStream(compressedBytes))
+                using (var compressedMemoryStream = new MemoryStream(block.Buffer))
                 using (var gzipStream = new GZipStream(compressedMemoryStream, CompressionMode.Decompress))
                 using (var decompressedMemoryStream = new MemoryStream())
                 {
@@ -256,45 +160,26 @@ namespace GzipTest
                     decompressedBytes = decompressedMemoryStream.ToArray();
                 }
 
-                while (true)
-                {
-                    lock (synchronizer.WriteLocker)
-                    {
-                        if (currentId == synchronizer.NextId)
-                        {
-                            _resultStream.Write(decompressedBytes, 0, decompressedBytes.Length);
+                block.Buffer = decompressedBytes;
 
-                            synchronizer.IncreaseNextId();
-
-                            Monitor.PulseAll(synchronizer.WriteLocker);
-
-                            break;
-                        }
-                        else
-                        {
-                            Monitor.Wait(synchronizer.WriteLocker);
-                        }
-                    }
-                }
+                _writer.PushBlock(block);
 
                 _progressBar.ShowProgress(_sourceStream.Position, _sourceStream.Length);
             }
         }
 
-        private bool CheckCompressedBlock(byte[] checkInfoBytes)
+        private void SetExceptions()
         {
-            const int validCompressedBlockInfo = 559903;
-
-            int currentCompressedBlockInfo = BitConverter.ToInt32(checkInfoBytes, 0);
-
-            if(validCompressedBlockInfo != currentCompressedBlockInfo)
+            if(_reader.FatalException != null)
             {
-                return false;
+                FatalException = _reader.FatalException;
+                _writer.Stop();
             }
-
-            return true;
+            else if(_writer.FatalException != null)
+            {
+                FatalException = _writer.FatalException;
+                _reader.Stop();
+            }
         }
-
-        #endregion
     }
 }
