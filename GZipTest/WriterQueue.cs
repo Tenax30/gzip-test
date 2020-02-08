@@ -7,17 +7,14 @@ using System.Threading.Tasks;
 
 namespace GzipTest
 {
-    class NumberedQueue
+    class WriterQueue
     {
-        private const int MaxBlockCount = 50;
-
         private readonly Queue<Block> _queue;
         private object _locker = new object();
-        private int currentId = 0;
+        private int _nextId = 0;
+        private bool _isStopped = false;
 
-        private AutoResetEvent _maxCountEvent = new AutoResetEvent(true);
-
-        public NumberedQueue()
+        public WriterQueue()
         {
             _queue = new Queue<Block>();
         }
@@ -28,20 +25,17 @@ namespace GzipTest
             {
                 lock (_locker)
                 {
-                    if(_queue.Count >= MaxBlockCount)
-                    {
-                        _maxCountEvent.WaitOne();
-                    }
-                    if (block.Id == currentId)
+                    if (block.Id == _nextId)
                     {
                         _queue.Enqueue(block);
-                        currentId++;
+                        _nextId++;
 
                         Monitor.PulseAll(_locker);
                         break;
                     }
                     else
                     {
+                        //if (_isStopped) return;
                         Monitor.Wait(_locker);
                     }
                 }
@@ -50,23 +44,30 @@ namespace GzipTest
 
         public Block Dequeue()
         {
-            while(true)
+            while (true)
             {
                 lock (_locker)
                 {
                     if (_queue.Count > 0)
                     {
-                        if(_queue.Count >= 50)
-                        {
-                            _maxCountEvent.Set();
-                        }
+                        Monitor.PulseAll(_locker);
                         return _queue.Dequeue();
                     }
                     else
                     {
+                        if (_isStopped) return null;
                         Monitor.Wait(_locker);
                     }
                 }
+            }
+        }
+
+        public void Unlock()
+        {
+            lock(_locker)
+            {
+                Monitor.PulseAll(_locker);
+                _isStopped = true;
             }
         }
 

@@ -10,95 +10,114 @@ namespace GzipTest
 {
     class Compressor
     {
-        private const int BlockSize = 1048576;
 
+
+        private readonly FileStream _sourceStream;
+        private readonly FileStream _resultStream;
         private readonly ProgressBar _progressBar;
 
-        private readonly Reader _reader;
-        private readonly Writer _writer;
+        private Reader _reader;
+        private Writer _writer;
 
-        private readonly NumberedQueue _readerQueue;
-        private readonly NumberedQueue _writerQueue;
+        private bool _isAborted = false;
+        private object _locker = new object();
+        private CompressionMode _mode;
 
-        public Exception FatalException { get; private set; }
+        public Exception FatalException { get; set; } = null;
 
         public Compressor(FileStream sourceStream, FileStream resultStream, ProgressBar progressBar)
         {
-            _readerQueue = new NumberedQueue();
-            _writerQueue = new NumberedQueue();
-
-            _reader = new Reader(sourceStream, _readerQueue, BlockSize);
-            _writer = new Writer(resultStream, _writerQueue);
-
+            _sourceStream = sourceStream;
+            _resultStream = resultStream;
             _progressBar = progressBar;
-
-            FatalException = null;
         }
-
-        #region Compression
 
         public void StartCompression()
         {
+            _mode = CompressionMode.Compress;
+            Start();
+        }
+
+        public void StartDecompression()
+        {
+            _mode = CompressionMode.Decompress;
+            Start();
+        }
+
+        private void Start()
+        {
+            _reader = new Reader(_sourceStream, _mode);
+            _writer = new Writer(_resultStream);
+
             _reader.StartRead();
             _writer.StartWrite();
 
-            var compressionThreads = new List<Thread>();
+            var threads = new List<Thread>();
 
-            for (int i = 0; i < Environment.ProcessorCount / 4; i++)
+            for (int i = 0; i < Environment.ProcessorCount; i++)
             {
-                var compressionThread = new Thread(() => Compress());
+                var thread = new Thread(() => TryWork(threads));
 
-                compressionThreads.Add(compressionThread);
+                threads.Add(thread);
             }
 
-            compressionThreads.ForEach(t => t.Start());
-            compressionThreads.ForEach(t => t.Join());
+            threads.ForEach(t => t.Start());
+            threads.ForEach(t => t.Join());
+
+            SetExceptions();
+            if (FatalException == null)
+                _writer.Stop();
         }
 
-        private void TryCompress(Synchronizer synchronizer, List<Thread> compressionThreads)
+        private void TryWork(List<Thread> compressionThreads)
         {
             try
             {
-                try
+                if(_mode == CompressionMode.Compress)
                 {
-                    //Compress(synchronizer);
+                    Compress();
                 }
-                catch (Exception ex)
+                else if(_mode == CompressionMode.Decompress)
                 {
-                    if(ex is ThreadAbortException)
-                    {
-                        throw;
-                    }
-
-                    lock(synchronizer.ExceptionLocker)
-                    {
-                        if(Thread.CurrentThread.ThreadState == ThreadState.AbortRequested)
-                        {
-                            return;
-                        }
-
-                        FatalException = ex;
-
-                        foreach(var thread in compressionThreads)
-                        {
-                           if(thread != Thread.CurrentThread)
-                           {
-                                thread.Abort();
-                           }
-                        }
-                    }
+                    Decompress();
                 }
             }
             catch(ThreadAbortException)
             {
             }
+            catch(Exception ex)
+            {
+                lock(_locker)
+                {
+                    if(_isAborted)
+                    {
+                        return;
+                    }
+
+                    FatalException = ex;
+                    _reader.Stop();
+                    _writer.Stop();
+                    _isAborted = true;
+
+                    foreach (var thread in compressionThreads)
+                    {
+                        if (thread != Thread.CurrentThread)
+                        {
+                            thread.Abort();
+                        }
+                    }
+                }
+            }
         }
 
         private void Compress()
         {
-            while (!_reader.IsFinished && _readerQueue.GetCount() > 0)
+            while ((!_reader.IsStopped || _reader.GetBlockCount() > 0) && !_writer.IsStopped)
             {
-                var block = _readerQueue.Dequeue();
+                var block = _reader.GetBlock();
+
+                if (block == null)
+                    break;
 
                 byte[] compressedBytes;
 
@@ -116,159 +135,51 @@ namespace GzipTest
 
                 block.Buffer = compressedBytes;
 
-                _writerQueue.Enqueue(block);
+                _writer.PushBlock(block);
 
-                //_progressBar.ShowProgress(_sourceStream.Position, _sourceStream.Length);
+                _progressBar.ShowProgress(_sourceStream.Position, _sourceStream.Length);
             }
         }
 
-        #endregion
+        private void Decompress()
+        {
+            while ((!_reader.IsStopped || _reader.GetBlockCount() > 0) && !_writer.IsStopped)
+            {
+                var block = _reader.GetBlock();
 
-        //#region Decompression
+                if (block == null)
+                    break;
 
-        //private const int CompressedBlockInfoLength = 8;
-        //private const int CheckBytesLength = 4;
+                byte[] decompressedBytes;
 
-        //public void StartDecompression()
-        //{
-        //    var synchronizer = new Synchronizer();
+                using (var compressedMemoryStream = new MemoryStream(block.Buffer))
+                using (var gzipStream = new GZipStream(compressedMemoryStream, CompressionMode.Decompress))
+                using (var decompressedMemoryStream = new MemoryStream())
+                {
+                    gzipStream.CopyTo(decompressedMemoryStream);
+                    decompressedBytes = decompressedMemoryStream.ToArray();
+                }
 
-        //    var decompressionThreads = new List<Thread>();
+                block.Buffer = decompressedBytes;
 
-        //    for (int i = 0; i < Environment.ProcessorCount; i++)
-        //    {
-        //        var decompressionThread = new Thread(() => TryDecompress(synchronizer, decompressionThreads));
+                _writer.PushBlock(block);
 
-        //        decompressionThreads.Add(decompressionThread);
-        //    }
+                _progressBar.ShowProgress(_sourceStream.Position, _sourceStream.Length);
+            }
+        }
 
-        //    decompressionThreads.ForEach(t => t.Start());
-        //    decompressionThreads.ForEach(t => t.Join());
-        //}
-
-        //private void TryDecompress(Synchronizer synchronizer, List<Thread> decompressionThreads)
-        //{
-        //    try
-        //    {
-        //        try
-        //        {
-        //            Decompress(synchronizer);
-        //        }
-        //        catch (Exception ex)
-        //        {
-        //            if (ex is ThreadAbortException)
-        //            {
-        //                throw;
-        //            }
-
-        //            lock (synchronizer.ExceptionLocker)
-        //            {
-        //                if (Thread.CurrentThread.ThreadState == ThreadState.AbortRequested)
-        //                {
-        //                    return;
-        //                }
-
-        //                FatalException = ex;
-
-        //                foreach (var thread in decompressionThreads)
-        //                {
-        //                    if (thread != Thread.CurrentThread)
-        //                    {
-        //                        thread.Abort();
-        //                    }
-        //                }
-        //            }
-        //        }
-        //    }
-        //    catch (ThreadAbortException)
-        //    {
-        //    }
-        //}
-
-        //private void Decompress(Synchronizer synchronizer)
-        //{
-        //    while (true)
-        //    {
-        //        int currentId;
-
-        //        byte[] compressedBytes;
-        //        byte[] blockInfoBytes = new byte[CompressedBlockInfoLength];
-
-        //        lock (synchronizer.ReadLocker)
-        //        {
-        //            long ureadedBytesLength = _sourceStream.Length - _sourceStream.Position;
-
-        //            if (ureadedBytesLength == 0)
-        //            {
-        //                break;
-        //            }
-
-        //            _sourceStream.Read(blockInfoBytes, 0, blockInfoBytes.Length);
-
-        //            bool isValidBlock = CheckCompressedBlock(blockInfoBytes.Take(CheckBytesLength).ToArray());
-
-        //            if (!isValidBlock)
-        //            {
-        //                throw new FileCorruptException();
-        //            }
-
-        //            int compressedBytesLength = BitConverter.ToInt32(blockInfoBytes, 4);
-        //            compressedBytes = new byte[compressedBytesLength];
-        //            blockInfoBytes.CopyTo(compressedBytes, 0);
-        //            _sourceStream.Read(compressedBytes, 8, compressedBytes.Length - 8);
-
-        //            currentId = synchronizer.GetFreeId();
-        //        }
-
-        //        byte[] decompressedBytes;
-
-        //        using (var compressedMemoryStream = new MemoryStream(compressedBytes))
-        //        using (var gzipStream = new GZipStream(compressedMemoryStream, CompressionMode.Decompress))
-        //        using (var decompressedMemoryStream = new MemoryStream())
-        //        {
-        //            gzipStream.CopyTo(decompressedMemoryStream);
-        //            decompressedBytes = decompressedMemoryStream.ToArray();
-        //        }
-
-        //        while (true)
-        //        {
-        //            lock (synchronizer.WriteLocker)
-        //            {
-        //                if (currentId == synchronizer.NextId)
-        //                {
-        //                    _resultStream.Write(decompressedBytes, 0, decompressedBytes.Length);
-
-        //                    synchronizer.IncreaseNextId();
-
-        //                    Monitor.PulseAll(synchronizer.WriteLocker);
-
-        //                    break;
-        //                }
-        //                else
-        //                {
-        //                    Monitor.Wait(synchronizer.WriteLocker);
-        //                }
-        //            }
-        //        }
-
-        //        _progressBar.ShowProgress(_sourceStream.Position, _sourceStream.Length);
-        //    }
-        //}
-
-        //private bool CheckCompressedBlock(byte[] checkInfoBytes)
-        //{
-        //    const int validCompressedBlockInfo = 559903;
-
-        //    int currentCompressedBlockInfo = BitConverter.ToInt32(checkInfoBytes, 0);
-
-        //    if(validCompressedBlockInfo != currentCompressedBlockInfo)
-        //    {
-        //        return false;
-        //    }
-
-        //    return true;
-        //}
-
-        //#endregion
+        private void SetExceptions()
+        {
+            if(_reader.FatalException != null)
+            {
+                FatalException = _reader.FatalException;
+                _writer.Stop();
+            }
+            else if(_writer.FatalException != null)
+            {
+                FatalException = _writer.FatalException;
+                _reader.Stop();
+            }
+        }
     }
 }

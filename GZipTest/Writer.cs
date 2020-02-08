@@ -11,16 +11,17 @@ namespace GzipTest
     class Writer
     {
         private readonly FileStream _resultStream;
-        private NumberedQueue _writerQueue;
+        private WriterQueue _writerQueue;
 
-        private object locker = new object();
+        public bool IsStopped { get; private set; }
 
-        private bool isStopped = false;
+        public Exception FatalException { get; set; } = null;
 
-        public Writer(FileStream resultStream, NumberedQueue writerQueue)
+        public Writer(FileStream resultStream)
         {
             _resultStream = resultStream;
-            _writerQueue = writerQueue;
+
+            _writerQueue = new WriterQueue();
         }
 
         public void StartWrite()
@@ -30,16 +31,36 @@ namespace GzipTest
 
         private void Write()
         {
-            while(!isStopped || _writerQueue.GetCount() > 0)
+            try
             {
-                var block = _writerQueue.Dequeue();
-                _resultStream.Write(block.Buffer, 0, block.Buffer.Length);
+                while (!IsStopped || _writerQueue.GetCount() > 0)
+                {
+                    var block = _writerQueue.Dequeue();
+                    if(block != null)
+                    {
+                        _resultStream.Write(block.Buffer, 0, block.Buffer.Length);
+                    }
+                }
             }
+            catch(Exception ex)
+            {
+                FatalException = ex;
+            }
+            finally
+            {
+                Stop();
+            }
+        }
+
+        public void PushBlock(Block block)
+        {
+            _writerQueue.Enqueue(block);
         }
 
         public void Stop()
         {
-
+            _writerQueue.Unlock();
+            IsStopped = true;
         }
     }
 }
