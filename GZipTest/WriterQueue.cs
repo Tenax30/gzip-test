@@ -35,7 +35,6 @@ namespace GzipTest
                     }
                     else
                     {
-                        //if (_isStopped) return;
                         Monitor.Wait(_locker);
                     }
                 }
